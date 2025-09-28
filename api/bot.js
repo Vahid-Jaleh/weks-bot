@@ -3,14 +3,15 @@ import { kv } from "@vercel/kv";
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const WEBAPP_URL = "https://weks-miniapp.vercel.app";
+const DAILY_CAP = 100;
+const COINS_PER_CORRECT = 10;
 
-// ------------ Helpers (Redis schema) --------------
-// Keys:
-// user:<id> -> { id, name, referred_by?, joined_at }
-// bal:<id>  -> integer balance
-// ref_claimed:<inviteeId> -> inviterId  (marker to avoid double-credit)
-// lb       -> sorted set (score=balance, member=userId)
-
+/* ---------- helpers ---------- */
+function todayStr() {
+  const d = new Date();
+  // Use UTC date for simplicity; change to your TZ if you like
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
 async function ensureUser(ctx) {
   const id = String(ctx.from.id);
   const key = `user:${id}`;
@@ -23,26 +24,30 @@ async function ensureUser(ctx) {
   }
   return u;
 }
-
 async function addCoins(id, amount) {
   const balKey = `bal:${id}`;
   const newBal = await kv.incrby(balKey, amount);
   await kv.zadd("lb", { score: newBal, member: String(id) });
   return newBal;
 }
-
 async function getBalance(id) {
   return (await kv.get(`bal:${id}`)) ?? 0;
 }
+async function getTodayCount(id) {
+  return (await kv.get(`daily:${id}:${todayStr()}`)) ?? 0;
+}
+async function addTodayCount(id, n) {
+  const key = `daily:${id}:${todayStr()}`;
+  return await kv.incrby(key, n);
+}
 
-// ------------ /start (+referrals) -----------------
-// referral link: t.me/WeksMathGameBot?start=ref_<inviterId>
+/* ---------- commands ---------- */
 bot.start(async (ctx) => {
   await ensureUser(ctx);
-
   const me = String(ctx.from.id);
-  const payload = ctx.startPayload || ""; // e.g., "ref_1234"
 
+  // referral
+  const payload = ctx.startPayload || ""; // "ref_<inviterId>"
   if (payload.startsWith("ref_")) {
     const inviter = payload.split("ref_")[1];
     if (inviter && inviter !== me) {
@@ -50,44 +55,38 @@ bot.start(async (ctx) => {
       if (!already) {
         await kv.set(`ref_claimed:${me}`, inviter);
         await addCoins(inviter, 2000);
-        await ctx.telegram.sendMessage(
-          inviter,
-          `🎉 Your invite joined! +2,000 coins credited.`
-        );
+        await ctx.telegram.sendMessage(inviter, `🎉 Your invite joined! +2,000 coins credited.`);
       }
     }
   }
 
-  const name = ctx.from.first_name || "there";
   const bal = await getBalance(me);
+  const done = await getTodayCount(me);
 
   await ctx.reply(
-    `👋 Hi ${name}!\n\nWelcome to *WEKS Tap-To-Math*.\n\n` +
-    `• Earn 10 coins per correct answer (game coming next)\n` +
-    `• Invite friends: +2,000 coins each\n` +
-    `• Your balance: *${bal} coins*\n\n` +
-    `Tap to play:`,
+    `👋 Hi ${ctx.from.first_name || "there"}!\n\n` +
+    `Welcome to *WEKS Tap-To-Math*.\n\n` +
+    `• Earn ${COINS_PER_CORRECT} coins per correct answer\n` +
+    `• Daily cap: ${DAILY_CAP} questions\n` +
+    `• Invite friends: +2,000 coins each\n\n` +
+    `Today: *${done}/${DAILY_CAP}* — Balance: *${bal}*\n\nTap to play:`,
     {
       parse_mode: "Markdown",
-      ...Markup.inlineKeyboard([ Markup.button.webApp("▶️ Play WEKS", WEBAPP_URL) ])
+      ...Markup.inlineKeyboard([Markup.button.webApp("▶️ Play WEKS", WEBAPP_URL)])
     }
   );
 });
 
-// ------------ Commands ----------------------------
 bot.command("balance", async (ctx) => {
   await ensureUser(ctx);
   const bal = await getBalance(ctx.from.id);
-  return ctx.reply(`💰 Balance: ${bal} coins`);
+  ctx.reply(`💰 Balance: ${bal} coins`);
 });
 
 bot.command("invite", async (ctx) => {
   await ensureUser(ctx);
   const uname = (await ctx.telegram.getMe()).username;
-  const link = `https://t.me/${uname}?start=ref_${ctx.from.id}`;
-  return ctx.reply(
-    `👯 Invite friends and earn +2,000 coins each!\nYour link:\n${link}`
-  );
+  ctx.reply(`👯 Invite link (earn +2,000/each):\nhttps://t.me/${uname}?start=ref_${ctx.from.id}`);
 });
 
 bot.command("leaderboard", async (ctx) => {
@@ -99,31 +98,62 @@ bot.command("leaderboard", async (ctx) => {
     const u = await kv.get(`user:${uid}`);
     out += `${i/2 + 1}. ${u?.name || uid} — ${score} coins\n`;
   }
-  return ctx.reply(out);
+  ctx.reply(out);
 });
 
-// Placeholder: add +10 coins when Mini App posts a "correct" event
-// Later we'll send real events from your WebApp using tg.sendData / web_app_data.
+bot.command("tasks", async (ctx) => {
+  await ensureUser(ctx);
+  const done = await getTodayCount(ctx.from.id);
+  ctx.reply(`🗓️ Today: ${done}/${DAILY_CAP} questions credited.`);
+});
+
+/* ---------- Mini App claim handler ----------
+   WebApp will send: sendData(JSON.stringify({ t: 'claim', correct: N }))
+   We cap to remaining allowance and credit coins.
+------------------------------------------------ */
 bot.on("message", async (ctx) => {
-  if (ctx.message?.web_app_data?.data) {
-    const data = ctx.message.web_app_data.data; // e.g., "correct"
-    if (data === "correct") {
-      const newBal = await addCoins(ctx.from.id, 10);
-      return ctx.reply(`✅ +10 coins! New balance: ${newBal}`);
+  const data = ctx.message?.web_app_data?.data;
+  if (!data) return;
+
+  try {
+    const parsed = JSON.parse(data);
+    if (parsed?.t === "claim") {
+      const me = String(ctx.from.id);
+      await ensureUser(ctx);
+
+      const correctRaw = Number(parsed.correct || 0);
+      if (!Number.isFinite(correctRaw) || correctRaw <= 0) {
+        return ctx.reply("❓ Nothing to claim.");
+      }
+
+      const done = await getTodayCount(me);
+      const remaining = Math.max(DAILY_CAP - done, 0);
+      const creditedQ = Math.min(correctRaw, remaining);
+
+      if (creditedQ <= 0) {
+        return ctx.reply(`✔️ Daily cap reached (${DAILY_CAP}/day). Come back tomorrow!`);
+      }
+
+      await addTodayCount(me, creditedQ);
+      const coins = creditedQ * COINS_PER_CORRECT;
+      const newBal = await addCoins(me, coins);
+
+      return ctx.reply(
+        `✅ Claimed ${creditedQ} correct answers (+${coins} coins).\n` +
+        `Today: ${done + creditedQ}/${DAILY_CAP}\n` +
+        `💰 Balance: ${newBal}`
+      );
     }
+  } catch {
+    // ignore malformed data
   }
 });
 
-// ------------ Vercel serverless entry -------------
+/* ---------- Vercel entry ---------- */
 export default async function handler(req, res) {
   if (req.method === "POST") {
-    try {
-      await bot.handleUpdate(req.body);
-      return res.status(200).end();
-    } catch (e) {
-      console.error(e);
-      return res.status(200).end();
-    }
+    try { await bot.handleUpdate(req.body); } catch (e) { console.error(e); }
+    return res.status(200).end();
   }
   return res.status(200).send("WEKS bot is running");
 }
