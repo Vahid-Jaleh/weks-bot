@@ -1,17 +1,24 @@
+// api/bot.js
 import { Telegraf, Markup } from "telegraf";
 import { kv } from "@vercel/kv";
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const WEBAPP_URL = "https://weks-miniapp.vercel.app";
-const DAILY_CAP = 100;
-const COINS_PER_CORRECT = 10;
+/** ====== Config ====== */
+const WEBAPP_URL = "https://weks-miniapp.vercel.app"; // your Mini App URL
+const DAILY_CAP = 100;                 // questions/day credited
+const COINS_PER_CORRECT = 10;          // coins per correct answer
 
-/* ---------- helpers ---------- */
-function todayStr() {
-  const d = new Date();
-  // Use UTC date for simplicity; change to your TZ if you like
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD
-}
+/** ====== Bot ====== */
+const bot = new Telegraf(process.env.BOT_TOKEN);
+
+/** ====== Helpers (KV schema) ======
+ * user:<id>          -> { id, name, joined_at, referred_by? }
+ * bal:<id>           -> integer balance
+ * daily:<id>:<date>  -> integer questions_credited_today
+ * ref_claimed:<id>   -> inviterId   (prevents double credit)
+ * lb                 -> sorted set (score=balance, member=userId)
+ */
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
 async function ensureUser(ctx) {
   const id = String(ctx.from.id);
   const key = `user:${id}`;
@@ -24,38 +31,32 @@ async function ensureUser(ctx) {
   }
   return u;
 }
+
 async function addCoins(id, amount) {
-  const balKey = `bal:${id}`;
-  const newBal = await kv.incrby(balKey, amount);
+  const newBal = await kv.incrby(`bal:${id}`, amount);
   await kv.zadd("lb", { score: newBal, member: String(id) });
   return newBal;
 }
-async function getBalance(id) {
-  return (await kv.get(`bal:${id}`)) ?? 0;
-}
-async function getTodayCount(id) {
-  return (await kv.get(`daily:${id}:${todayStr()}`)) ?? 0;
-}
-async function addTodayCount(id, n) {
-  const key = `daily:${id}:${todayStr()}`;
-  return await kv.incrby(key, n);
-}
 
-/* ---------- commands ---------- */
+const getBalance = (id) => kv.get(`bal:${id}`).then(v => v ?? 0);
+const getTodayCount = (id) => kv.get(`daily:${id}:${todayStr()}`).then(v => v ?? 0);
+const addTodayCount = (id, n) => kv.incrby(`daily:${id}:${todayStr()}`, n);
+
+/** ====== /start (with referrals) ====== */
 bot.start(async (ctx) => {
   await ensureUser(ctx);
   const me = String(ctx.from.id);
 
-  // referral
-  const payload = ctx.startPayload || ""; // "ref_<inviterId>"
+  // referral payload pattern: start=ref_<inviterId>
+  const payload = ctx.startPayload || "";
   if (payload.startsWith("ref_")) {
-    const inviter = payload.split("ref_")[1];
+    const inviter = payload.slice(4);
     if (inviter && inviter !== me) {
       const already = await kv.get(`ref_claimed:${me}`);
       if (!already) {
         await kv.set(`ref_claimed:${me}`, inviter);
         await addCoins(inviter, 2000);
-        await ctx.telegram.sendMessage(inviter, `🎉 Your invite joined! +2,000 coins credited.`);
+        await ctx.telegram.sendMessage(inviter, "🎉 Your invite joined! +2,000 coins credited.");
       }
     }
   }
@@ -77,16 +78,18 @@ bot.start(async (ctx) => {
   );
 });
 
+/** ====== Commands ====== */
 bot.command("balance", async (ctx) => {
   await ensureUser(ctx);
   const bal = await getBalance(ctx.from.id);
-  ctx.reply(`💰 Balance: ${bal} coins`);
+  return ctx.reply(`💰 Balance: ${bal} coins`);
 });
 
 bot.command("invite", async (ctx) => {
   await ensureUser(ctx);
   const uname = (await ctx.telegram.getMe()).username;
-  ctx.reply(`👯 Invite link (earn +2,000/each):\nhttps://t.me/${uname}?start=ref_${ctx.from.id}`);
+  const link = `https://t.me/${uname}?start=ref_${ctx.from.id}`;
+  return ctx.reply(`👯 Invite friends and earn +2,000 each!\nYour link:\n${link}`);
 });
 
 bot.command("leaderboard", async (ctx) => {
@@ -98,58 +101,59 @@ bot.command("leaderboard", async (ctx) => {
     const u = await kv.get(`user:${uid}`);
     out += `${i/2 + 1}. ${u?.name || uid} — ${score} coins\n`;
   }
-  ctx.reply(out);
+  return ctx.reply(out);
 });
 
 bot.command("tasks", async (ctx) => {
   await ensureUser(ctx);
   const done = await getTodayCount(ctx.from.id);
-  ctx.reply(`🗓️ Today: ${done}/${DAILY_CAP} questions credited.`);
+  return ctx.reply(`🗓️ Today credited: ${done}/${DAILY_CAP} questions`);
 });
 
-/* ---------- Mini App claim handler ----------
-   WebApp will send: sendData(JSON.stringify({ t: 'claim', correct: N }))
-   We cap to remaining allowance and credit coins.
------------------------------------------------- */
+/** ====== WebApp Claim Handler ======
+ * Mini App sends: tg.sendData(JSON.stringify({ t:'claim', correct }))
+ * We cap by remaining allowance, credit coins, and reply.
+ */
 bot.on("message", async (ctx) => {
   const data = ctx.message?.web_app_data?.data;
-  if (!data) return;
+  if (!data) return; // ignore other messages
 
   try {
-    const parsed = JSON.parse(data);
-    if (parsed?.t === "claim") {
-      const me = String(ctx.from.id);
-      await ensureUser(ctx);
+    const msg = JSON.parse(data);
+    if (msg?.t !== "claim") return;
 
-      const correctRaw = Number(parsed.correct || 0);
-      if (!Number.isFinite(correctRaw) || correctRaw <= 0) {
-        return ctx.reply("❓ Nothing to claim.");
-      }
+    const me = String(ctx.from.id);
+    await ensureUser(ctx);
 
-      const done = await getTodayCount(me);
-      const remaining = Math.max(DAILY_CAP - done, 0);
-      const creditedQ = Math.min(correctRaw, remaining);
-
-      if (creditedQ <= 0) {
-        return ctx.reply(`✔️ Daily cap reached (${DAILY_CAP}/day). Come back tomorrow!`);
-      }
-
-      await addTodayCount(me, creditedQ);
-      const coins = creditedQ * COINS_PER_CORRECT;
-      const newBal = await addCoins(me, coins);
-
-      return ctx.reply(
-        `✅ Claimed ${creditedQ} correct answers (+${coins} coins).\n` +
-        `Today: ${done + creditedQ}/${DAILY_CAP}\n` +
-        `💰 Balance: ${newBal}`
-      );
+    const correctRaw = Number(msg.correct || 0);
+    if (!Number.isFinite(correctRaw) || correctRaw <= 0) {
+      return ctx.reply("❓ Nothing to claim.");
     }
-  } catch {
-    // ignore malformed data
+
+    const done = await getTodayCount(me);
+    const remaining = Math.max(DAILY_CAP - done, 0);
+    const creditedQ = Math.min(correctRaw, remaining);
+
+    if (creditedQ <= 0) {
+      return ctx.reply(`✔️ Daily cap reached (${DAILY_CAP}/day). Come back tomorrow!`);
+    }
+
+    await addTodayCount(me, creditedQ);
+    const coins = creditedQ * COINS_PER_CORRECT;
+    const newBal = await addCoins(me, coins);
+
+    return ctx.reply(
+      `✅ Claimed ${creditedQ} correct answers (+${coins} coins).\n` +
+      `Today: ${done + creditedQ}/${DAILY_CAP}\n` +
+      `💰 Balance: ${newBal}`
+    );
+  } catch (e) {
+    console.error("web_app_data parse error:", e);
+    // soft fail (no throw), avoid webhook retries
   }
 });
 
-/* ---------- Vercel entry ---------- */
+/** ====== Vercel Serverless entry ====== */
 export default async function handler(req, res) {
   if (req.method === "POST") {
     try { await bot.handleUpdate(req.body); } catch (e) { console.error(e); }
