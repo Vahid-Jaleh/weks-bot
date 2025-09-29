@@ -2,11 +2,9 @@
 import crypto from "crypto";
 import { kv } from "@vercel/kv";
 
-// ===== config (keep in sync with bot.js) =====
 const DAILY_CAP = 100;
 const COINS_PER_CORRECT = 10;
 
-// ----- KV helpers (same as in bot.js) -----
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const getUserKey = (id) => `user:${id}`;
 
@@ -21,26 +19,28 @@ async function ensureUser(id, name = "Player") {
   }
   return u;
 }
-
 async function addCoins(id, amount) {
   const newBal = await kv.incrby(`bal:${id}`, amount);
   await kv.zadd("lb", { score: newBal, member: String(id) });
   return newBal;
 }
-const getBalance   = (id) => kv.get(`bal:${id}`).then(v => v ?? 0);
-const getToday     = (id) => kv.get(`daily:${id}:${todayStr()}`).then(v => v ?? 0);
-const addToday     = (id,n)=> kv.incrby(`daily:${id}:${todayStr()}`, n);
+const getBalance = (id) => kv.get(`bal:${id}`).then((v) => v ?? 0);
+const getToday   = (id) => kv.get(`daily:${id}:${todayStr()}`).then((v) => v ?? 0);
+const addToday   = (id,n)=> kv.incrby(`daily:${id}:${todayStr()}`, n);
 
-// ----- Telegram WebApp initData verification -----
-// https://core.telegram.org/bots/webapps#validating-data-received-via-the-web-app
+// --- CORS helper ---
+function cors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
 function verifyInitData(initData, botToken) {
   if (!initData || !botToken) return null;
-
   const params = new URLSearchParams(initData);
   const hash = params.get("hash");
   if (!hash) return null;
 
-  // Build data_check_string (all params except 'hash', sorted)
   const entries = [];
   for (const [k, v] of params.entries()) {
     if (k === "hash") continue;
@@ -53,28 +53,27 @@ function verifyInitData(initData, botToken) {
   const calcHash = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
   if (calcHash !== hash) return null;
 
-  // Parse user payload
   const userJson = params.get("user");
   if (!userJson) return null;
-
   try {
     const user = JSON.parse(userJson);
-    return {
-      id: String(user.id),
-      name: user.first_name || "Player"
-    };
-  } catch {
-    return null;
-  }
+    return { id: String(user.id), name: user.first_name || "Player" };
+  } catch { return null; }
 }
 
 export default async function handler(req, res) {
+  cors(res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
   }
 
   try {
-    const { initData, correct } = req.body || {};
+    // Vercel normally parses JSON; handle string just in case
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const { initData, correct } = body;
+
     const auth = verifyInitData(initData, process.env.BOT_TOKEN);
     if (!auth) {
       return res.status(401).json({ ok: false, error: "INVALID_INITDATA" });
@@ -95,12 +94,8 @@ export default async function handler(req, res) {
     if (creditedQ <= 0) {
       const bal = await getBalance(uid);
       return res.status(200).json({
-        ok: true,
-        creditedQ: 0,
-        coins: 0,
-        today: done,
-        dailyCap: DAILY_CAP,
-        balance: bal,
+        ok: true, creditedQ: 0, coins: 0,
+        today: done, dailyCap: DAILY_CAP, balance: bal,
         message: "DAILY_CAP_REACHED"
       });
     }
@@ -110,12 +105,8 @@ export default async function handler(req, res) {
     const newBal = await addCoins(uid, coins);
 
     return res.status(200).json({
-      ok: true,
-      creditedQ,
-      coins,
-      today: done + creditedQ,
-      dailyCap: DAILY_CAP,
-      balance: newBal
+      ok: true, creditedQ, coins,
+      today: done + creditedQ, dailyCap: DAILY_CAP, balance: newBal
     });
   } catch (e) {
     console.error("claim error:", e);
