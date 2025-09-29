@@ -2,6 +2,9 @@
 import crypto from "crypto";
 import { kv } from "@vercel/kv";
 
+const DAILY_CAP = 100;
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
 function verifyInitData(initData, botToken) {
   if (!initData || !botToken) return null;
   const params = new URLSearchParams(initData);
@@ -24,17 +27,17 @@ function verifyInitData(initData, botToken) {
   if (!userJson) return null;
   try {
     const user = JSON.parse(userJson);
-    return { id: String(user.id), name: user.first_name || "Player" };
+    return { id: String(user.id) };
   } catch {
     return null;
   }
 }
 
 export default async function handler(req, res) {
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
   if (req.method === "OPTIONS") return res.status(204).end();
 
   if (req.method !== "POST") {
@@ -44,11 +47,14 @@ export default async function handler(req, res) {
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
     const { initData } = body;
+
     const auth = verifyInitData(initData, process.env.BOT_TOKEN);
     if (!auth) return res.status(401).json({ ok: false, error: "INVALID_INITDATA" });
 
-    const bal = (await kv.get(`bal:${auth.id}`)) ?? 0;
-    return res.status(200).json({ ok: true, balance: bal });
+    const balance = (await kv.get(`bal:${auth.id}`)) ?? 0;
+    const todayUsed = (await kv.get(`daily:${auth.id}:${todayStr()}`)) ?? 0;
+
+    return res.status(200).json({ ok: true, balance, todayUsed, dailyCap: DAILY_CAP });
   } catch (e) {
     console.error("balance error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
